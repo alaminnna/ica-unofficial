@@ -1,0 +1,9 @@
+test/
+examples/
+docs/
+*.log
+node_modules/
+html/
+bug.md
+.codegraph
+.omo

@@ -1,0 +1,13 @@
+{
+  "_note": "FCA library config example. Transport/logging/rateGuard map to new Client(opts); retry keys are honored by runners (see test/bot.js). Session path + bot-only settings (prefix, replies, typing) live in test/bot.config.json.",
+  "proxy": "",
+  "autoReconnect": true,
+  "reconnectMaxRetries": 5,
+  "maxReloginAttempts": 1,
+  "listenMode": "auto",
+  "listenPollInterval": 3000,
+  "rateGuard": { "maxActions": 5, "windowMs": 10000, "spacingMs": 200 },
+  "logLevel": "info",
+  "showBanner": true,
+  "logColors": true
+}
