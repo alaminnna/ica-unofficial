@@ -291,9 +291,10 @@ async function listen(client, onEvent, options) {
       store = null;
     } else {
       try {
-        store = openStore({});
+        store = openStore(opts.store === undefined || opts.store === null ? {} : opts.store);
         storeOpened = true;
-      } catch (ignored) {
+      } catch (err) {
+        debug('listening store unavailable, continuing without persistence: ' + String((err && err.message) || err));
         store = null;
       }
     }
@@ -509,7 +510,7 @@ async function listen(client, onEvent, options) {
     const everyMs = 6 * 60 * 60 * 1000; // 6h
     pruneTimer = setInterval(() => {
       try {
-        store.prune(14);
+        store.prune(); // store applies its own configured retention
       } catch (ignored) {
         // retention pruning is best-effort
       }

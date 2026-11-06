@@ -396,6 +396,219 @@ test('mqttot: connectPacket/decodePacket round-trip stays intact', () => {
   assert.strictEqual(decoded.packetType, 'connack_decode_not_valid_but_no_throw' === 'never' ? 'x' : String(packet[0] >> 4));
 });
 
+// ---------- 11. tiered listening store (smart/full/memory) ----------
+
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { openStore } = require('../src/listening/store');
+
+let sqliteAvailable = true;
+try {
+  require('better-sqlite3');
+} catch (err) {
+  sqliteAvailable = false;
+}
+
+function tmpStoreDir() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'ica-store-'));
+}
+
+function makeMsg(id, threadId, userId, tsOffsetMs) {
+  return {
+    itemId: id,
+    threadId: threadId || 'thr1',
+    userId: userId || 'user1',
+    text: `hello ${id}`,
+    itemType: 'text',
+    tsUs: (Date.now() + (tsOffsetMs || 0)) * 1000,
+    raw: { id, text: `hello ${id}`, blob: 'x'.repeat(2048) },
+  };
+}
+
+test('store (smart): raw never persisted, text persisted, hot read works', () => {
+  if (!sqliteAvailable) { return; }
+  const dir = tmpStoreDir();
+  const store = openStore({ dir });
+  try {
+    assert.strictEqual(store.mode, 'smart');
+    store.upsertMessage(makeMsg('m1', 'thr1', 'user1'));
+    const hit = store.getMessage('m1');
+    assert.strictEqual(hit.user_id, 'user1');
+    assert.strictEqual(hit.text, 'hello m1');
+    store.flush();
+    const stats = store.stats();
+    assert.strictEqual(stats.dirty, 0);
+    assert.strictEqual(stats.messages, 1);
+    assert.strictEqual(stats.mode, 'smart');
+  } finally {
+    store.close();
+  }
+  // reopen: the flushed row must serve attribution without the hot tier
+  const store2 = openStore({ dir });
+  try {
+    const row = store2.getMessage('m1');
+    assert.strictEqual(row.user_id, 'user1');
+    assert.strictEqual(row.text, 'hello m1');
+    assert.strictEqual(row.raw, null); // smart tier never persists raw
+  } finally {
+    store2.close();
+  }
+});
+
+test('store (smart): bounded maxMessages evicts oldest rows', () => {
+  if (!sqliteAvailable) { return; }
+  const dir = tmpStoreDir();
+  const store = openStore({ dir, maxMessages: 3 });
+  try {
+    for (let i = 0; i < 6; i += 1) {
+      store.upsertMessage(makeMsg(`m${i}`, 'thr1', `u${i}`, i * 1000));
+    }
+    store.flush();
+    store.prune();
+    assert(store.stats().messages <= 3, `bounded at 3, got ${store.stats().messages}`);
+    assert.strictEqual(store.getMessage('m5').user_id, 'u5'); // newest survives
+  } finally {
+    store.close();
+  }
+});
+
+test('store: prune(0) wipes cold-tier rows; hot tier keeps serving live entries', async () => {
+  if (!sqliteAvailable) { return; }
+  const dir = tmpStoreDir();
+  const store = openStore({ dir });
+  try {
+    store.upsertMessage(makeMsg('m1'));
+    store.flush();
+    await sleep(3); // let created_at age past the prune(0) cutoff (ms boundary)
+    store.prune(0);
+    assert.strictEqual(store.stats().messages, 0); // cold tier wiped
+    assert.strictEqual(store.getMessage('m1').user_id, 'user1'); // hot tier keeps live reads
+  } finally {
+    store.close();
+  }
+  const store2 = openStore({ dir });
+  try {
+    assert.strictEqual(store2.getMessage('m1'), null); // nothing comes back from disk
+  } finally {
+    store2.close();
+  }
+});
+
+test('store (full): raw payloads are persisted like 2.9.1', () => {
+  if (!sqliteAvailable) { return; }
+  const dir = tmpStoreDir();
+  const store = openStore({ dir, mode: 'full' });
+  try {
+    assert.strictEqual(store.mode, 'full');
+    store.upsertMessage(makeMsg('m1'));
+    store.close();
+    const store2 = openStore({ dir, mode: 'full' });
+    try {
+      const rows = store2.threadMessages('thr1', 10);
+      assert.strictEqual(rows.length, 1);
+      assert(rows[0].raw && rows[0].raw.indexOf('m1') !== -1, 'raw JSON kept in full mode');
+    } finally {
+      store2.close();
+    }
+  } finally {
+    // store already closed above
+  }
+});
+
+test("store ('memory'): zero disk, full API surface", () => {
+  const store = openStore('memory');
+  try {
+    assert.strictEqual(store.mode, 'memory');
+    assert.strictEqual(store.file, null);
+    assert.strictEqual(store.stats().sizeBytes, 0);
+    store.upsertMessage(makeMsg('m1'));
+    assert.strictEqual(store.getMessage('m1').user_id, 'user1');
+    store.upsertMessage({ itemId: 'm2', threadId: 'thr1', userId: 'bot1' });
+    store.markMessageDeleted('m2');
+    assert.strictEqual(store.getMessage('m2').is_deleted, 1);
+    assert.strictEqual(store.threadMessages('thr1').length, 2);
+    // kv / outbox / fixtures round-trips
+    store.kvSet('cursor', 'abc');
+    assert.strictEqual(store.kvGet('cursor'), 'abc');
+    const id = store.outboxInsert('evt-1', 'message', { a: 1 });
+    assert.strictEqual(store.outboxInsert('evt-1', 'message', { a: 1 }), null); // dedupe
+    assert.strictEqual(store.outboxPending().length, 1);
+    store.outboxAck(id);
+    assert.strictEqual(store.outboxPending().length, 0);
+    store.fixtureSave('f', { x: 1 });
+    assert.strictEqual(JSON.parse(store.fixtureGet('f')).x, 1);
+    store.prune();
+  } finally {
+    store.close();
+  }
+});
+
+test('store: unknown mode throws with the valid modes listed', () => {
+  assert.throws(() => openStore({ mode: 'wat' }), /unknown listening store mode/);
+  assert.throws(() => openStore('wat'), /unknown listening store option/);
+});
+
+test('store: threadMessages merges unflushed hot entries', () => {
+  if (!sqliteAvailable) { return; }
+  const dir = tmpStoreDir();
+  const store = openStore({ dir });
+  try {
+    store.upsertMessage(makeMsg('m1', 'thr1', 'u1', 0));
+    store.upsertMessage(makeMsg('m2', 'thr1', 'u2', 1000));
+    // no flush — reads must still see both, ordered by ts
+    const rows = store.threadMessages('thr1', 10);
+    assert.strictEqual(rows.length, 2);
+    assert.strictEqual(rows[0].item_id, 'm1');
+    assert.strictEqual(rows[1].item_id, 'm2');
+  } finally {
+    store.close();
+  }
+});
+
+test('store: hot tier stays bounded under cap', () => {
+  if (!sqliteAvailable) { return; }
+  const dir = tmpStoreDir();
+  const store = openStore({ dir, hotCap: 10, maxMessages: 100 });
+  try {
+    for (let i = 0; i < 50; i += 1) {
+      store.upsertMessage(makeMsg(`m${i}`, 'thr1', `u${i}`, i * 1000));
+    }
+    assert(store.stats().hot.size <= 10, `hot bounded at 10, got ${store.stats().hot.size}`);
+    store.flush();
+    assert.strictEqual(store.stats().messages, 50); // disk keeps everything within cap
+    assert.strictEqual(store.getMessage('m49').user_id, 'u49');
+  } finally {
+    store.close();
+  }
+});
+
+test('store: v3 attribution round-trip survives store close/reopen', () => {
+  if (!sqliteAvailable) { return; }
+  const dir = tmpStoreDir();
+  const store = openStore({ dir });
+  store.upsertMessage(makeMsg('parent1', 'thr1', 'authorA'));
+  store.close();
+  // simulate restart: fresh store + fresh tracker over the same db file
+  const store2 = openStore({ dir });
+  try {
+    const v3 = createV3Tracker({ client: { userId: 'bot1' }, store: store2, emit: () => {} });
+    const out = v3.afterMessage({
+      message: { id: 'child1', thread_id: 'thr1', user_id: 'someone', text: 'x',
+        replied_to_message: { item_id: 'parent1' } },
+    });
+    const attach = out.find((o) => o.kind === '__attach');
+    assert(attach, 'replyTo attach produced');
+    assert.strictEqual(typeof attach.patch, 'function');
+    const evt = {};
+    attach.patch(evt);
+    assert.strictEqual(evt.replyTo.authorUserId, 'authorA'); // cold-tier lookup after restart
+    assert.strictEqual(evt.replyTo.partial, false);
+  } finally {
+    store2.close();
+  }
+});
+
 // ---------- runner ----------
 
 process.on('unhandledRejection', (err) => {

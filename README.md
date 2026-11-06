@@ -75,6 +75,14 @@
 
 ## ✨ What's New in ica-unofficial
 
+<sub>**2.9.2 — tiered listening storage**</sub>
+
+| | Change |
+| :-- | :-- |
+| 🗄️ | **Smart bounded store** — the listening DB stops hoarding messages: last 2000 messages / 24h by default, raw payloads never written, legacy DBs shrink on first open. Full history stays available via `store: { mode: 'full' }`; zero-disk mode via `store: 'memory'`. |
+| ⚡ | **In-memory hot tier** — reply/reaction attribution reads from a bounded TTL cache; message writes are batched into one SQLite transaction instead of hitting disk per message. |
+| 📊 | **`store.stats()`** — mode, DB size, row counts, hot-tier fill and pending writes at a glance. |
+
 <sub>**2.9.1 — realtime security & leak hardening**</sub>
 
 | | Change |
@@ -342,6 +350,47 @@ client.setOptions({
   logLevel: "info",    // silent / error / warn / info / verbose
 });
 ```
+
+### Listening store (`store` option)
+
+`client.listen()` keeps a small local store (default
+`./ica-alaminnna/ica-unofficial.db`) for reply/reaction attribution — so
+`replyTo.authorUserId` and derived `bot:*` events survive restarts without
+extra API calls. Since 2.9.2 it is tiered and bounded: recent messages live in
+memory, only the last 2000 messages within 24h touch disk, raw payloads are
+never written.
+
+```javascript
+// default — smart mode, bounded disk (~2000 rows / 24h)
+const stop = client.listen(handler);
+
+// zero disk — everything in memory, no file is ever created
+const stop = client.listen(handler, { store: "memory" });
+
+// no store at all (legacy `false` behaviour, attribution inline-only)
+const stop = client.listen(handler, { store: false });
+
+// keep full history like 2.9.1 (raw payloads, 14 days, 50k rows)
+const stop = client.listen(handler, { store: { mode: "full" } });
+
+// or tune smart mode
+const stop = client.listen(handler, {
+  store: {
+    mode: "smart",        // 'smart' | 'full' | 'memory'
+    dir: "./ica-alaminnna", // DB folder (smart/full only)
+    file: "ica-unofficial.db",
+    retentionHours: 24,   // how long messages live on disk
+    maxMessages: 2000,    // hard cap of message rows
+    persistRaw: false,    // raw payloads are the bloat — off by default
+    flushMs: 2000,        // batched-write interval
+  },
+});
+```
+
+`store.stats()` reports mode, file, DB size, row counts, hot-tier fill and
+pending writes. Bring your own store with `listeningStore` (any object with
+the same methods). The DB folder can be deleted while the bot is stopped — it
+is rebuilt automatically.
 
 ## 📋 Logging
 

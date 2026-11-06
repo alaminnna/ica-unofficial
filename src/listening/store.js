@@ -1,24 +1,37 @@
 /**
  * @alaminnna/ica-unofficial — listening/store
  *
- * RESPONSIBILITY: sqlite snapshot store only — kv cursors, threads, messages,
+ * RESPONSIBILITY: tiered snapshot store — in-memory hot tier (instant reads,
+ *   batched writes) over a bounded SQLite cold tier. Cursors, threads,
  *   reactions, outbox, fixtures (+migrations, retention prune, WAL).
  * AUTHOR:         Al A Min (Alaminnna) — https://alaminnna.ami.bd
- * MAY USE:        better-sqlite3, node:fs, node:path
+ * MAY USE:        better-sqlite3, node:fs, node:path, ./hotstore
  * MUST NOT:       never network here; never import feature mixins
  *
  * DEBUG: when cursors reset or events replay, start looking here — db file
- *   location (consumer cwd/ica-alaminnna) or schema_ver migrations
+ *   location (consumer cwd/ica-alaminnna), mode config, or schema_ver
+ *   migrations. If the DB grows unbounded you are in 'full' mode.
+ *
+ * MODES (openStore options.mode):
+ *   'smart'  default — bounded disk: last maxMessages (2000) within
+ *            retentionHours (24), raw payloads never persisted. Tiny DB that
+ *            still recovers reply/reaction attribution across restarts.
+ *   'full'   legacy 2.9.1 behaviour — raw payloads persisted, 14-day
+ *            retention, 50k messages. Only for bots that query history.
+ *   'memory' no disk at all (see ./hotstore createMemoryStore).
  */
 
 'use strict';
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { createHotMessages, createMemoryStore, toRow } = require('./hotstore');
 
 const STORE_DIR_NAME = 'ica-alaminnna';
 const STORE_FILE_NAME = 'ica-unofficial.db';
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
+const MODES = ['smart', 'full'];
+const FLUSH_BATCH = 250;
 
 // Consumer project root (their cwd) → ./ica-alaminnna/ica-unofficial.db
 function resolveStorePaths(options) {
@@ -27,6 +40,11 @@ function resolveStorePaths(options) {
   const file = opts.file || path.join(dir, STORE_FILE_NAME);
   return { dir, file };
 }
+
+const MODE_DEFAULTS = {
+  smart: { retentionHours: 24, maxMessages: 2000, persistRaw: false, hotCap: 4000, hotTtlMs: 24 * 3600 * 1000 },
+  full: { retentionHours: 14 * 24, maxMessages: 50000, persistRaw: true, hotCap: 8000, hotTtlMs: 24 * 3600 * 1000 },
+};
 
 const MIGRATIONS = [
   `
@@ -68,20 +86,50 @@ const MIGRATIONS = [
   ALTER TABLE messages ADD COLUMN is_self INTEGER DEFAULT 0;
   CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages (parent_item_id);
   `,
+  `
+  CREATE INDEX IF NOT EXISTS idx_messages_created ON messages (created_at);
+  CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages (ts_us);
+  `,
 ];
 
 function openStore(options) {
+  if (typeof options === 'string') {
+    if (options === 'memory') {
+      return createMemoryStore({});
+    }
+    throw new Error(`@alaminnna/ica-unofficial: unknown listening store option '${options}' (use false | 'memory' | { mode: 'smart' | 'full', ... })`);
+  }
   const opts = options || {};
+  if (opts.mode === 'memory') {
+    return createMemoryStore(opts);
+  }
+  const mode = opts.mode || 'smart';
+  if (!MODES.includes(mode)) {
+    throw new Error(`@alaminnna/ica-unofficial: unknown listening store mode '${mode}' (valid: smart | full | memory)`);
+  }
+  const defaults = MODE_DEFAULTS[mode];
+  const cfg = {
+    retentionHours: opts.retentionHours !== undefined ? Number(opts.retentionHours) : defaults.retentionHours,
+    maxMessages: opts.maxMessages !== undefined ? Math.max(1, Math.floor(Number(opts.maxMessages))) : defaults.maxMessages,
+    persistRaw: opts.persistRaw !== undefined ? Boolean(opts.persistRaw) : defaults.persistRaw,
+    flushMs: opts.flushMs !== undefined ? Math.max(250, Math.floor(Number(opts.flushMs))) : 2000,
+  };
+  const hot = createHotMessages({
+    cap: opts.hotCap !== undefined ? opts.hotCap : defaults.hotCap,
+    ttlMs: opts.hotTtlMs !== undefined ? opts.hotTtlMs : defaults.hotTtlMs,
+  });
+
   const { dir, file } = resolveStorePaths(opts);
   fs.mkdirSync(dir, { recursive: true });
   let Database;
   try {
     Database = require('better-sqlite3');
   } catch (err) {
-    throw new Error('@alaminnna/ica-unofficial: listening store needs better-sqlite3: npm install better-sqlite3');
+    throw new Error(`@alaminnna/ica-unofficial: listening store needs better-sqlite3: npm install better-sqlite3 (or use store: 'memory')`);
   }
   const db = new Database(file);
   db.pragma('journal_mode = WAL');
+  db.pragma('synchronous = NORMAL');
   db.exec(MIGRATIONS[0]);
   const versionRow = db.prepare('SELECT v FROM kv WHERE k = ?').get('schema_ver');
   const version = versionRow ? Number(versionRow.v) || 0 : 0;
@@ -93,12 +141,108 @@ function openStore(options) {
   }
   db.prepare('INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v')
     .run('schema_ver', String(SCHEMA_VERSION));
+  // The smart tier never reads raw payloads — drop what legacy 'full' mode
+  // left behind so old databases shrink on first open instead of growing.
+  if (!cfg.persistRaw) {
+    db.exec('UPDATE messages SET raw = NULL WHERE raw IS NOT NULL');
+  }
 
   const now = () => Date.now();
+  const dirty = new Map(); // item_id -> slim row, flushed to disk in one transaction
+  let flushTimer = null;
+
+  const insertStmt = db.prepare(`INSERT INTO messages (item_id, thread_id, item_type, text, user_id, ts_us, raw, is_edited, is_deleted, created_at, parent_item_id, is_self)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(item_id) DO UPDATE SET thread_id = excluded.thread_id, item_type = excluded.item_type,
+    text = excluded.text, user_id = excluded.user_id, ts_us = excluded.ts_us,
+    is_edited = excluded.is_edited, is_deleted = excluded.is_deleted,
+    parent_item_id = excluded.parent_item_id, is_self = excluded.is_self`);
+
+  function enforceMessageCap() {
+    db.prepare(`DELETE FROM messages WHERE item_id NOT IN (
+      SELECT item_id FROM messages ORDER BY ts_us DESC LIMIT ?
+    )`).run(cfg.maxMessages);
+  }
+
+  function flush() {
+    if (dirty.size === 0) {
+      return 0;
+    }
+    const rows = [...dirty.values()];
+    dirty.clear();
+    db.transaction(() => {
+      rows.forEach((r) => {
+        insertStmt.run(r.itemId, r.threadId, r.itemType, r.text, r.userId, r.tsUs, r.raw, r.isEdited, r.isDeleted, r.at, r.parentItemId, r.isSelf);
+      });
+    })();
+    enforceMessageCap();
+    return rows.length;
+  }
+
+  function scheduleFlush() {
+    if (flushTimer) {
+      return;
+    }
+    flushTimer = setInterval(() => {
+      try {
+        flush();
+      } catch (ignored) {
+        // background flush is best-effort; hot tier keeps serving reads
+      }
+    }, cfg.flushMs);
+    if (flushTimer.unref) {
+      flushTimer.unref();
+    }
+  }
+
+  function stageMessage(message) {
+    const m = message || {};
+    if (!m.itemId) {
+      return;
+    }
+    const entry = {
+      itemId: String(m.itemId),
+      threadId: m.threadId || null,
+      itemType: m.itemType || null,
+      text: typeof m.text === 'string' ? m.text : null,
+      userId: m.userId || null,
+      tsUs: m.tsUs === undefined || m.tsUs === null ? null : Number(m.tsUs),
+      raw: cfg.persistRaw ? (m.raw === undefined ? null : (typeof m.raw === 'string' ? m.raw : JSON.stringify(m.raw))) : null,
+      isEdited: m.isEdited ? 1 : 0,
+      isDeleted: m.isDeleted ? 1 : 0,
+      parentItemId: m.parentItemId || null,
+      isSelf: m.isSelf ? 1 : 0,
+      at: now(),
+    };
+    hot.set({ ...entry, raw: m.raw });
+    dirty.set(entry.itemId, entry);
+    if (dirty.size >= FLUSH_BATCH) {
+      flush();
+    } else {
+      scheduleFlush();
+    }
+  }
+
+  function count(table) {
+    return db.prepare(`SELECT COUNT(*) AS c FROM ${table}`).get().c;
+  }
+
+  scheduleFlush();
 
   return {
+    mode,
     file,
+    flush,
     close() {
+      if (flushTimer) {
+        clearInterval(flushTimer);
+        flushTimer = null;
+      }
+      try {
+        flush();
+      } catch (ignored) {
+        // teardown is best-effort
+      }
       db.close();
     },
     kvGet(key) {
@@ -122,29 +266,39 @@ function openStore(options) {
     getThread(threadId) {
       return db.prepare('SELECT * FROM threads WHERE thread_v2_id = ?').get(String(threadId)) || null;
     },
-    upsertMessage(message) {
-      const m = message || {};
-      db.prepare(`INSERT INTO messages (item_id, thread_id, item_type, text, user_id, ts_us, raw, is_edited, is_deleted, created_at, parent_item_id, is_self)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(item_id) DO UPDATE SET thread_id = excluded.thread_id, item_type = excluded.item_type,
-        text = excluded.text, user_id = excluded.user_id, ts_us = excluded.ts_us, raw = excluded.raw,
-        is_edited = excluded.is_edited, is_deleted = excluded.is_deleted,
-        parent_item_id = excluded.parent_item_id, is_self = excluded.is_self`)
-        .run(m.itemId, m.threadId || null, m.itemType || null, m.text || null, m.userId || null,
-          m.tsUs === undefined || m.tsUs === null ? null : Number(m.tsUs),
-          m.raw === undefined ? null : JSON.stringify(m.raw),
-          m.isEdited ? 1 : 0, m.isDeleted ? 1 : 0, now(),
-          m.parentItemId || null, m.isSelf ? 1 : 0);
-    },
+    upsertMessage: stageMessage,
     getMessage(itemId) {
-      return db.prepare('SELECT * FROM messages WHERE item_id = ?').get(String(itemId)) || null;
+      const id = String(itemId);
+      const entry = hot.get(id);
+      if (entry) {
+        return toRow(entry);
+      }
+      const row = db.prepare('SELECT * FROM messages WHERE item_id = ?').get(id) || null;
+      if (row) {
+        hot.set({ itemId: row.item_id, threadId: row.thread_id, itemType: row.item_type, text: row.text,
+          userId: row.user_id, tsUs: row.ts_us, raw: row.raw, isEdited: row.is_edited, isDeleted: row.is_deleted,
+          parentItemId: row.parent_item_id, isSelf: row.is_self, at: row.created_at || now() });
+      }
+      return row;
     },
     markMessageDeleted(itemId) {
-      db.prepare('UPDATE messages SET is_deleted = 1 WHERE item_id = ?').run(String(itemId));
+      hot.markDeleted(itemId);
+      const prev = dirty.get(String(itemId)) || hot.get(String(itemId)) || { itemId: String(itemId) };
+      dirty.set(String(itemId), { ...prev, isDeleted: 1 });
+      scheduleFlush();
     },
     threadMessages(threadId, limit) {
-      return db.prepare('SELECT * FROM messages WHERE thread_id = ? ORDER BY ts_us ASC LIMIT ?')
-        .all(String(threadId), limit || 200);
+      const cap = limit || 200;
+      const rows = db.prepare('SELECT * FROM messages WHERE thread_id = ? ORDER BY ts_us ASC LIMIT ?')
+        .all(String(threadId), cap);
+      const seen = new Set(rows.map((r) => r.item_id));
+      hot.forThread(threadId).forEach((entry) => {
+        if (!seen.has(entry.itemId) && rows.length < cap) {
+          rows.push(toRow(entry));
+        }
+      });
+      rows.sort((a, b) => (a.ts_us || 0) - (b.ts_us || 0));
+      return rows.slice(0, cap);
     },
     upsertReaction(reaction) {
       const r = reaction || {};
@@ -192,10 +346,36 @@ function openStore(options) {
       const row = db.prepare('SELECT raw FROM fixtures WHERE name = ?').get(String(name));
       return row ? row.raw : null;
     },
-    prune(retentionDays) {
-      const cutoff = now() - (retentionDays || 14) * 24 * 3600 * 1000;
+    prune(retentionDaysArg) {
+      const retentionMs = retentionDaysArg === undefined || retentionDaysArg === null
+        ? cfg.retentionHours * 3600 * 1000
+        : Number(retentionDaysArg) * 24 * 3600 * 1000;
+      const cutoff = now() - Math.max(0, retentionMs);
       db.prepare('DELETE FROM messages WHERE created_at < ?').run(cutoff);
       db.prepare("DELETE FROM outbox WHERE status = 'delivered' AND delivered_at < ?").run(now() - 7 * 24 * 3600 * 1000);
+      enforceMessageCap();
+      hot.prune();
+    },
+    stats() {
+      let sizeBytes = 0;
+      try {
+        sizeBytes = fs.statSync(file).size;
+      } catch (ignored) {
+        // file not yet materialized
+      }
+      return {
+        mode,
+        file,
+        schemaVersion: SCHEMA_VERSION,
+        sizeBytes,
+        messages: count('messages'),
+        threads: count('threads'),
+        reactions: count('reactions'),
+        outbox: count('outbox'),
+        hot: { size: hot.size, cap: hot.cap, ttlMs: hot.ttlMs },
+        dirty: dirty.size,
+        config: { ...cfg },
+      };
     },
   };
 }
@@ -204,6 +384,7 @@ module.exports = {
   STORE_DIR_NAME,
   STORE_FILE_NAME,
   SCHEMA_VERSION,
+  MODES,
   resolveStorePaths,
   openStore,
 };

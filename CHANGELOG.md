@@ -1,5 +1,45 @@
 # Changelog
 
+## v2.9.2 (2026-11-06)
+
+Tiered listening-storage overhaul — the store stops hoarding messages and
+keeps only what attribution actually needs. The store API is backwards
+compatible (`openStore` / `opts.store: false` / `opts.listeningStore` all keep
+working); the suite grows to 30 tests.
+
+- **Why messages were in the DB at all:** the listener stores recent messages
+  for one reason — reply/reaction attribution. When someone replies to an
+  older message, the payload often omits the parent's author, so the library
+  looks it up (`store.getMessage`) to fill `replyTo.authorUserId` and derive
+  `bot:reply` events. Everything else about a message was dead weight.
+- **Hot tier (in-memory, always on).** Every recent message now lives in a
+  bounded TTL map (`hotCap` 4000 / `hotTtlMs` 24h). Reads (attribution,
+  `threadMessages`) hit memory first; the per-message hot path no longer pays
+  a SQLite round-trip.
+- **Cold tier is bounded by default (`smart` mode).** SQLite keeps at most
+  `maxMessages` (2000) rows within `retentionHours` (24) — enough to recover
+  attribution across a restart, tiny DB forever. Raw payloads are never
+  persisted in smart mode, and opening a legacy database NULLs stored raw
+  JSON so old files shrink on first open.
+- **Batched writes.** Message writes are staged and flushed in one
+  transaction every `flushMs` (2s), after 250 pending rows, or on
+  `close()`/`stop()` — instead of one synchronous INSERT per message.
+  WAL + `synchronous = NORMAL`.
+- **`store: 'memory'` — zero-disk mode.** Full store interface (attribution,
+  kv, outbox, fixtures) backed entirely by bounded Maps; no file is ever
+  created. `store: false` keeps its legacy meaning (no store at all).
+- **`store: { ... }` configuration.** `client.listen({ store: { mode, dir,
+  file, retentionHours, maxMessages, persistRaw, flushMs, hotCap, hotTtlMs } })`;
+  unknown modes fail loudly with the valid list. Misconfigured stores now log
+  a visible warning instead of failing silently.
+- **`store.stats()`.** `mode`, `file`, `sizeBytes`, row counts, hot-tier
+  fill, dirty-write count and the effective config, for observability.
+- **Schema v3** adds `created_at`/`ts_us` indexes (fast retention pruning and
+  oldest-first eviction). `prune()` now uses the store's configured retention
+  by default; `prune(days)` still works.
+- Thread snapshots were already tracked in memory (`v3.snapshots`, capped);
+  the `threads` table remains a consumer-facing API and is unchanged.
+
 ## v2.9.1 (2026-11-05)
 
 Security/robustness hardening round (MQTT realtime, leaks, error isolation) —
