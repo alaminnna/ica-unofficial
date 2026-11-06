@@ -1,27 +1,149 @@
-name: publish
+# Publishes @alaminnna/ica-unofficial to npm using npm Trusted Publishing (OIDC).
+#
+# No NPM_TOKEN, npm password, or other long-lived publishing secret is used.
+# npm >= 11.5.1 exchanges the job's ephemeral OIDC token (minted via
+# `permissions: id-token: write`) for a short-lived publish credential.
+#
+# The npm package settings must register this exact trusted publisher:
+#   Publisher: GitHub Actions
+#   Organization/User: alaminnna
+#   Repository: ica-unofficial
+#   Workflow filename: publish.yml
+#   Environment: <empty> (this workflow does not use a GitHub Environment)
+#
+# Guards below fail fast on: release tag / package.json version mismatch,
+# duplicate versions already on the registry, repository-field mismatch
+# (a provenance requirement), and an unusable OIDC setup.
+
+name: Publish to npm (Trusted Publishing)
 
 on:
-  push:
-    tags:
-      - 'v*'
+  release:
+    types: [published]
+
+# Least privilege: no permissions at the workflow level; the job grants
+# exactly what OIDC trusted publishing needs.
+permissions: {}
+
+# One publish at a time, repo-wide; an in-flight publish is never cancelled.
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   publish:
+    name: Validate & publish (OIDC)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
-      contents: write
+      id-token: write # mint the OIDC token npm exchanges for a publish credential
+      contents: read  # checkout the source at the release tag
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: 20
-          cache: npm
-          registry-url: https://registry.npmjs.org
-      - run: npm ci
-      - run: npm test
-      - run: npm publish --access public
+          persist-credentials: false # no git credentials needed; nothing is pushed
+
+      # ---- Version & metadata guards (fail fast, before any install) ----
+
+      - name: Verify release tag matches package.json version
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - uses: softprops/action-gh-release@v2
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          echo "release tag: $RELEASE_TAG | package.json version: $VERSION"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid semver in package.json: '$VERSION'"
+            exit 1
+          fi
+          if [[ "$RELEASE_TAG" != "v$VERSION" && "$RELEASE_TAG" != "$VERSION" ]]; then
+            echo "::error::Release tag '$RELEASE_TAG' does not match package.json version '$VERSION' (expected 'v$VERSION' or '$VERSION'). Refusing to publish."
+            exit 1
+          fi
+
+      - name: Verify package metadata & repository binding
+        run: |
+          NAME="$(node -p "require('./package.json').name")"
+          if [ -z "$NAME" ]; then
+            echo "::error::package.json has no name."
+            exit 1
+          fi
+          if ! node -e 'if (require("./package.json").private) process.exit(1)'; then
+            echo "::error::package.json is private:true — refusing to publish."
+            exit 1
+          fi
+          REPO="$(node -e 'const r=require("./package.json").repository||{};const u=typeof r==="string"?r:(r.url||"");process.stdout.write(u.replace(/^git\+/, "").replace(/^https?:\/\/[^\/]+\//, "").replace(/\.git$/, "").replace(/\/$/, ""))')"
+          echo "package.json repository -> $REPO | github.repository -> $GITHUB_REPOSITORY"
+          if [ "$REPO" != "$GITHUB_REPOSITORY" ]; then
+            echo "::error::package.json repository field ('${REPO:-<missing>}') does not match this repository ('$GITHUB_REPOSITORY'). npm provenance requires them to match."
+            exit 1
+          fi
+
+      - name: Reject versions already published to npm
+        run: |
+          NAME="$(node -p "require('./package.json').name")"
+          VERSION="$(node -p "require('./package.json').version")"
+          # Unauthenticated registry lookup. For a public package an existing
+          # version is visible here; for a private one it is not, but npm
+          # itself rejects duplicate versions at publish time.
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "::error::$NAME@$VERSION already exists on the npm registry — refusing to publish a duplicate version."
+            exit 1
+          fi
+          echo "$NAME@$VERSION is not on the npm registry yet — safe to publish."
+
+      # ---- Node.js & OIDC readiness ----
+
+      - name: Set up Node.js LTS
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          generate_release_notes: true
+          node-version: lts/*
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false # no dependency cache in release builds (deterministic publish)
+
+      - name: Verify OIDC readiness & npm CLI version
+        run: |
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "::error::OIDC token endpoint is not available — the job must have 'permissions: id-token: write'."
+            exit 1
+          fi
+          if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::error::NODE_AUTH_TOKEN is set in the environment; Trusted Publishing must not use long-lived tokens. Remove the secret from the environment/repository."
+            exit 1
+          fi
+          NPM_VERSION="$(npm --version)"
+          echo "npm CLI: $NPM_VERSION (Trusted Publishing requires >= 11.5.1)"
+          if [ "$(printf '%s\n' 11.5.1 "$NPM_VERSION" | sort -V | head -n 1)" != "11.5.1" ]; then
+            echo "::error::npm $NPM_VERSION is too old for OIDC trusted publishing (need >= 11.5.1)."
+            exit 1
+          fi
+
+      # ---- Install, build, test ----
+
+      - name: Install dependencies
+        # package-lock.json (lockfileVersion 3) exists at the repo root, so npm ci is used.
+        run: npm ci
+
+      - name: Build
+        # No "build" script exists in package.json (verified) — --if-present makes this a no-op
+        # and keeps the workflow correct if a build script is added later.
+        run: npm run build --if-present
+
+      - name: Test
+        # "test": "node test/run.js" — hermetic suite, 21 tests, no Instagram traffic.
+        run: npm test
+
+      # ---- Validate the package, then publish ----
+
+      - name: Validate package contents (dry run)
+        run: npm pack --dry-run
+
+      - name: Publish to npm with provenance
+        # With Trusted Publishing, provenance is generated via OIDC; the flag
+        # makes the intent explicit. No --access flag: the package is already
+        # public on npm and npm keeps the existing access level.
+        run: npm publish --provenance
