@@ -142,9 +142,16 @@ class FbnsDeviceAuth {
     this.handlers[event].push(handler);
   }
 
+  // Isolate handler errors — one bad bot callback must not break dispatch.
   emit(event, payload) {
     (this.handlers[event] || []).forEach((handler) => {
-      handler(payload);
+      try {
+        handler(payload);
+      } catch (err) {
+        if (process.env.ICA_DEBUG === '1') {
+          console.error('[ica-unofficial] fbns handler error for event "' + event + '": ' + String((err && err.message) || err));
+        }
+      }
     });
   }
 
@@ -187,11 +194,21 @@ class FbnsDeviceAuth {
   }
 
   async connect(register) {
-    await this.transport.connect();
-    await this.transport.send(mqttot.connectPacket(this.buildConnection(), 60));
-    const packet = mqttot.decodePacket(await this.transport.recvPacket());
-    if (packet.packetType !== 'connack' || packet.returnCode !== 0) {
-      throw new Error('@alaminnna/ica-unofficial: FBNS MQTT connect failed: ' + packet.returnCode);
+    this.connected = false;
+    try {
+      await this.transport.connect();
+      await this.transport.send(mqttot.connectPacket(this.buildConnection(), 60));
+      const packet = mqttot.decodePacket(await this.transport.recvPacket());
+      if (packet.packetType !== 'connack' || packet.returnCode !== 0) {
+        throw new Error('@alaminnna/ica-unofficial: FBNS MQTT connect failed: ' + packet.returnCode);
+      }
+    } catch (err) {
+      try {
+        this.transport.disconnect();
+      } catch (ignored) {
+        // teardown best-effort; the original error is what matters
+      }
+      throw err;
     }
     this.auth.read(packet.payload);
     this.auth.save(this.api);

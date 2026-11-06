@@ -398,24 +398,42 @@ function decodePacket(packet) {
   return { packetType: String(typeId), payload: body };
 }
 
+// Largest MQTT packet we are willing to buffer. MQTT allows up to 256MB, but
+// Instagram payloads are a few KB — anything near this cap is a malformed or
+// hostile stream, and buffering it blindly is an OOM risk.
+const MAX_PACKET_BYTES = 8 * 1024 * 1024;
+
 function readExact(socket, length) {
   return new Promise((resolve, reject) => {
     let acc = Buffer.alloc(0);
+    let settled = false;
+    function cleanup() {
+      socket.removeListener('data', onData);
+      socket.removeListener('error', onError);
+      socket.removeListener('close', onClose);
+    }
     function onData(chunk) {
       acc = Buffer.concat([acc, chunk]);
       if (acc.length >= length) {
-        socket.removeListener('data', onData);
-        socket.removeListener('error', onError);
-        socket.removeListener('close', onClose);
+        settled = true;
+        cleanup();
         resolve({ data: acc.slice(0, length), rest: acc.slice(length) });
       }
     }
     function onError(err) {
-      socket.removeListener('data', onData);
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
       reject(err);
     }
     function onClose() {
-      socket.removeListener('data', onData);
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
       reject(new Error('@alaminnna/ica-unofficial: socket closed mid-packet'));
     }
     socket.on('data', onData);
@@ -447,6 +465,12 @@ async function readPacketFromSocket(socket, buffered) {
     if ((digit & 0x80) === 0) {
       break;
     }
+    if (remaining > MAX_PACKET_BYTES) {
+      throw new Error('@alaminnna/ica-unofficial: mqtt packet exceeds ' + MAX_PACKET_BYTES + ' bytes — refusing to buffer');
+    }
+  }
+  if (remaining > MAX_PACKET_BYTES) {
+    throw new Error('@alaminnna/ica-unofficial: mqtt packet exceeds ' + MAX_PACKET_BYTES + ' bytes — refusing to buffer');
   }
   parts.push(await take(remaining));
   return { packet: Buffer.concat(parts), rest: acc };
@@ -459,38 +483,133 @@ function createTransport(options) {
   const timeoutMs = options.timeoutMs || 30000;
   let socket = null;
   let rest = Buffer.alloc(0);
+  // Serialize recvPacket(): concurrent readers on one TCP socket each receive
+  // the same 'data' chunks (watchdog ping + read loop), which duplicates bytes
+  // and corrupts the MQTT stream. Queue reads instead.
+  let readChain = Promise.resolve();
+  // Errors arriving outside any read (e.g. between packets) must be stored,
+  // not emitted: a socket with no 'error' listener crashes the whole process.
+  let lastError = null;
+  function failSocket(err) {
+    // already torn down (intentional disconnect) — don't resurrect the error
+    if (!socket) {
+      return;
+    }
+    lastError = err;
+    rest = Buffer.alloc(0);
+    const dead = socket;
+    socket = null;
+    dead.destroy();
+  }
   return {
+    get connected() {
+      return socket !== null;
+    },
     connect() {
       return new Promise((resolve, reject) => {
-        const onError = (err) => reject(err);
+        let settled = false;
+        const onConnectError = (err) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          failSocket(err);
+          reject(err);
+        };
+        const onTimeout = () => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          failSocket(new Error('@alaminnna/ica-unofficial: mqtt connect timed out after ' + timeoutMs + 'ms'));
+          reject(new Error('@alaminnna/ica-unofficial: mqtt connect timed out after ' + timeoutMs + 'ms'));
+        };
         if (useTls) {
           socket = tls.connect({ host, port, minVersion: 'TLSv1.2', timeout: timeoutMs }, () => {
-            socket.removeListener('error', onError);
+            if (settled) {
+              return;
+            }
+            settled = true;
+            socket.setTimeout(0);
+            socket.setKeepAlive(true, 15000);
+            socket.removeAllListeners('timeout');
+            socket.once('timeout', () => {
+              // connect-phase timeout that slipped past setTimeout(0) race
+              failSocket(new Error('@alaminnna/ica-unofficial: mqtt socket timeout'));
+            });
             resolve();
           });
         } else {
           socket = net.connect({ host, port, timeout: timeoutMs }, () => {
-            socket.removeListener('error', onError);
+            if (settled) {
+              return;
+            }
+            settled = true;
+            socket.setTimeout(0);
+            socket.setKeepAlive(true, 15000);
+            socket.removeAllListeners('timeout');
             resolve();
           });
         }
-        socket.once('error', onError);
+        socket.once('error', onConnectError);
+        socket.once('timeout', onTimeout);
+        socket.once('close', () => {
+          if (!settled) {
+            settled = true;
+            socket = null;
+            reject(new Error('@alaminnna/ica-unofficial: mqtt socket closed during connect'));
+          }
+        });
+      }).then(() => {
+        // Persistent handlers for the lifetime of the socket: without any
+        // 'error' listener a later ECONNRESET/TLS alert kills the process,
+        // and without a 'close' handler the transport would keep its dead
+        // socket reference — the next read attaches listeners to a closed
+        // socket and hangs forever (bot freeze after any connection drop).
+        socket.once('error', (err) => failSocket(err));
+        socket.once('close', () => {
+          if (socket) {
+            failSocket(new Error('@alaminnna/ica-unofficial: mqtt socket closed'));
+          }
+        });
+        rest = Buffer.alloc(0);
+        lastError = null;
       });
     },
     send(buf) {
+      if (!socket) {
+        return Promise.reject(new Error('@alaminnna/ica-unofficial: mqtt transport is closed' + (lastError ? ' (last error: ' + lastError.message + ')' : '')));
+      }
       return new Promise((resolve, reject) => {
         socket.write(buf, (err) => (err ? reject(err) : resolve()));
       });
     },
-    async recvPacket() {
-      const result = await readPacketFromSocket(socket, rest);
-      rest = result.rest;
-      return result.packet;
+    recvPacket() {
+      const attempt = () => {
+        if (!socket) {
+          return Promise.reject(new Error('@alaminnna/ica-unofficial: mqtt transport is closed' + (lastError ? ' (last error: ' + lastError.message + ')' : '')));
+        }
+        if (lastError) {
+          const err = lastError;
+          failSocket(err);
+          return Promise.reject(err);
+        }
+        return readPacketFromSocket(socket, rest).then((result) => {
+          rest = result.rest;
+          return result.packet;
+        });
+      };
+      const run = readChain.then(attempt, attempt);
+      // keep the chain alive even when a read fails
+      readChain = run.then(() => undefined, () => undefined);
+      return run;
     },
     disconnect() {
+      lastError = null;
       if (socket) {
-        socket.destroy();
+        const dead = socket;
         socket = null;
+        dead.destroy();
       }
       rest = Buffer.alloc(0);
     },
@@ -501,6 +620,7 @@ module.exports = {
   TOPICS,
   FBNS_TOPICS,
   THRIFT,
+  MAX_PACKET_BYTES,
   compress,
   tryDecompress,
   writeThrift,

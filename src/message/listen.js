@@ -270,6 +270,15 @@ async function listen(client, onEvent, options) {
       console.log('[@alaminnna/ica-unofficial:listen]', ...args);
     }
   };
+  // Wrap realtime event handlers: any unexpected throw (bad payload shape,
+  // library bug) must degrade to a log line, never break the read loop.
+  const safe = (fn) => (...args) => {
+    try {
+      fn(...args);
+    } catch (err) {
+      debug('listener handler error: ' + String((err && err.message) || err));
+    }
+  };
   const seen = new Map();
   let stopped = false;
   let attempt = 0;
@@ -373,7 +382,13 @@ async function listen(client, onEvent, options) {
         v3.noteActionLog({ ...inner, user_id: inner.user_id }, data.thread_id || inner.thread_id);
       }
     }
-    onEvent(evt);
+    // User callbacks are untrusted: a throwing bot handler must not kill the
+    // read loop (which would reconnect-storm Instagram). Log and continue.
+    try {
+      onEvent(evt);
+    } catch (err) {
+      debug('onEvent handler error (' + kind + '): ' + String((err && err.message) || err));
+    }
     extras.forEach((extra) => emit(extra.kind, extra.data));
   }
 
@@ -395,7 +410,7 @@ async function listen(client, onEvent, options) {
       : null;
     rt = opts.realtimeClient || singleton || new RealtimeClient(api);
     if (!rt._listenBound) {
-      rt.on('message', (payload) => {
+      rt.on('message', safe((payload) => {
         debugRawItem(payload);
         const actionLog = toActionLogEvent(payload);
         if (actionLog) {
@@ -415,17 +430,17 @@ async function listen(client, onEvent, options) {
           return;
         }
         emit('message', messageFromSync(payload));
-      });
-      rt.on('typing', (payload) => emit('typing', payload));
-      rt.on('presence', (payload) => emit('presence', payload));
-      rt.on('seen', (payload) => emit('seen', payload));
-      rt.on('thread_update', (payload) => {
+      }));
+      rt.on('typing', safe((payload) => emit('typing', payload)));
+      rt.on('presence', safe((payload) => emit('presence', payload)));
+      rt.on('seen', safe((payload) => emit('seen', payload)));
+      rt.on('thread_update', safe((payload) => {
         if (v3.isCoveredThreadUpdate(payload)) {
           return;
         }
         emit('event', payload);
-      });
-      rt.on('direct', (payload) => {
+      }));
+      rt.on('direct', safe((payload) => {
         const directValue = payload && typeof payload === 'object'
           ? (payload.value !== undefined ? payload.value : payload)
           : null;
@@ -443,9 +458,9 @@ async function listen(client, onEvent, options) {
           return;
         }
         emit(classified.kind, classified.data);
-      });
-      rt.on('typing', (payload) => emit('typ', payload));
-      rt.on('seen', (payload) => emit('read_receipt', payload));
+      }));
+      rt.on('typing', safe((payload) => emit('typ', payload)));
+      rt.on('seen', safe((payload) => emit('read_receipt', payload)));
       rt._listenBound = true;
     }
     await rt.connect();
@@ -484,6 +499,30 @@ async function listen(client, onEvent, options) {
 
   function isSessionExpiredMessage(msg) {
     return msg.indexOf('login') !== -1 || msg.indexOf('Login') !== -1 || msg.indexOf('session') !== -1;
+  }
+
+  let pruneTimer = null;
+  function startStorePrune() {
+    if (!storeOpened || !store || typeof store.prune !== 'function' || pruneTimer) {
+      return;
+    }
+    const everyMs = 6 * 60 * 60 * 1000; // 6h
+    pruneTimer = setInterval(() => {
+      try {
+        store.prune(14);
+      } catch (ignored) {
+        // retention pruning is best-effort
+      }
+    }, everyMs);
+    if (pruneTimer.unref) {
+      pruneTimer.unref();
+    }
+  }
+  function stopStorePrune() {
+    if (pruneTimer) {
+      clearInterval(pruneTimer);
+      pruneTimer = null;
+    }
   }
 
   let watchdog = null;
@@ -568,6 +607,7 @@ async function listen(client, onEvent, options) {
         activeMode = 'mqtt';
         modeReason = 'connected';
         startWatchdog();
+        startStorePrune();
         while (!stopped) {
           const out = await rt.readOnce();
           if (out && out.packetType === 'disconnect') {
@@ -580,7 +620,7 @@ async function listen(client, onEvent, options) {
           break;
         }
         const msg = String((err && err.message) || err);
-        if (msg.indexOf('login') !== -1 || msg.indexOf('Login') !== -1 || msg.indexOf('session') !== -1) {
+        if (isSessionExpiredMessage(msg)) {
           debug('session expired, stopping');
           try {
             if (rt) {
@@ -616,6 +656,7 @@ async function listen(client, onEvent, options) {
     stopCount += 1;
     stopped = true;
     stopWatchdog();
+    stopStorePrune();
     client._realtime = null;
     if (storeOpened && store && typeof store.close === 'function') {
       try {

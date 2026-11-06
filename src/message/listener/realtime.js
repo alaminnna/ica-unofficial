@@ -55,9 +55,17 @@ class RealtimeClient {
     this.handlers[event].push(handler);
   }
 
+  // A throwing handler (bot code) must never break packet processing or the
+  // read loop — isolate each handler and keep dispatching the rest.
   emit(event, payload) {
     (this.handlers[event] || []).forEach((handler) => {
-      handler(payload);
+      try {
+        handler(payload);
+      } catch (err) {
+        if (process.env.ICA_DEBUG === '1') {
+          console.error('[ica-unofficial] handler error for event "' + event + '": ' + String((err && err.message) || err));
+        }
+      }
     });
   }
 
@@ -109,11 +117,23 @@ class RealtimeClient {
   }
 
   async connect() {
-    await this.transport.connect();
-    await this.transport.send(mqttot.connectPacket(this.buildConnection(), 20));
-    const packet = mqttot.decodePacket(await this.transport.recvPacket());
-    if (packet.packetType !== 'connack' || packet.returnCode !== 0) {
-      throw new Error('@alaminnna/ica-unofficial: realtime MQTT connect failed: ' + packet.returnCode);
+    // A previously "connected" flag must not survive a dead socket — the
+    // watchdog keys off it and would ping a closed transport.
+    this.connected = false;
+    try {
+      await this.transport.connect();
+      await this.transport.send(mqttot.connectPacket(this.buildConnection(), 20));
+      const packet = mqttot.decodePacket(await this.transport.recvPacket());
+      if (packet.packetType !== 'connack' || packet.returnCode !== 0) {
+        throw new Error('@alaminnna/ica-unofficial: realtime MQTT connect failed: ' + packet.returnCode);
+      }
+    } catch (err) {
+      try {
+        this.transport.disconnect();
+      } catch (ignored) {
+        // teardown best-effort; the original error is what matters
+      }
+      throw err;
     }
     this.connected = true;
     this.connectedSince = Date.now();

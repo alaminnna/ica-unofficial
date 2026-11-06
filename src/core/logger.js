@@ -177,6 +177,7 @@ function spinner(text, options) {
   let timer = null;
 
   const spinnerObj = {
+    get stopped() { return stopped; },
     render() {
       if (stopped) return;
       const ch = SPINNER_FRAMES[frame % SPINNER_FRAMES.length];
@@ -187,6 +188,7 @@ function spinner(text, options) {
       if (stopped) return;
       stopped = true;
       clearInterval(timer);
+      if (activeSpinner === spinnerObj) { activeSpinner = null; }
       process.stdout.write('\r\x1b[K');
       process.stdout.write(colorize('✓', '\x1b[32m') + ' ' + (finalText || text) + '\n');
     },
@@ -194,6 +196,7 @@ function spinner(text, options) {
       if (stopped) return;
       stopped = true;
       clearInterval(timer);
+      if (activeSpinner === spinnerObj) { activeSpinner = null; }
       process.stdout.write('\r\x1b[K');
       process.stdout.write(colorize('✗', '\x1b[31m') + ' ' + (finalText || text) + '\n');
     },
@@ -201,12 +204,19 @@ function spinner(text, options) {
       if (stopped) return;
       stopped = true;
       clearInterval(timer);
+      if (activeSpinner === spinnerObj) { activeSpinner = null; }
       process.stdout.write('\r\x1b[K');
     },
   };
 
+  if (activeSpinner && !activeSpinner.stopped) {
+    activeSpinner.stop();
+  }
   activeSpinner = spinnerObj;
+  // Creating a second spinner overwrote the global reference while the first
+  // one's interval kept firing forever — stop the previous one first.
   timer = setInterval(() => spinnerObj.render(), interval);
+  if (timer.unref) { timer.unref(); }
   spinnerObj.render();
 
   return spinnerObj;
@@ -243,6 +253,7 @@ function pulse(textFn, options) {
   let timer = null;
 
   const pulseObj = {
+    get stopped() { return stopped; },
     render() {
       if (stopped) return;
       const text = typeof textFn === 'function' ? textFn() : textFn;
@@ -252,12 +263,17 @@ function pulse(textFn, options) {
       if (stopped) return;
       stopped = true;
       clearInterval(timer);
+      if (activePulse === pulseObj) { activePulse = null; }
       process.stdout.write('\r\x1b[K');
     },
   };
 
+  if (activePulse && !activePulse.stopped) {
+    activePulse.stop();
+  }
   activePulse = pulseObj;
   timer = setInterval(() => pulseObj.render(), interval);
+  if (timer.unref) { timer.unref(); }
   pulseObj.render();
 
   return pulseObj;

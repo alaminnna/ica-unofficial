@@ -39,9 +39,21 @@ function currentVersion() {
 }
 
 function compareVersions(a, b) {
-  const pa = String(a || '').split('.');
-  const pb = String(b || '').split('.');
+  // Split pre-release suffix first: 2.9.1-beta.1 must rank BELOW 2.9.1,
+  // which the naive string fallback would get wrong.
+  const splitPre = (v) => {
+    const s = String(v || '');
+    const dash = s.indexOf('-');
+    return { core: (dash === -1 ? s : s.slice(0, dash)), pre: dash === -1 ? null : s.slice(dash + 1) };
+  };
+  const A = splitPre(a);
+  const B = splitPre(b);
+  const pa = A.core.split('.');
+  const pb = B.core.split('.');
   const n = Math.max(pa.length, pb.length);
+  // missing segments are zero: 2.9 == 2.9.0
+  while (pa.length < n) { pa.push('0'); }
+  while (pb.length < n) { pb.push('0'); }
   for (let i = 0; i < n; i += 1) {
     const na = Number(pa[i]);
     const nb = Number(pb[i]);
@@ -53,6 +65,14 @@ function compareVersions(a, b) {
       }
     } else if (na !== nb) {
       return na < nb ? -1 : 1;
+    }
+  }
+  if (A.pre !== null || B.pre !== null) {
+    // equal cores: a version with a pre-release tag is older
+    if (A.pre === null) return 1;
+    if (B.pre === null) return -1;
+    if (A.pre !== B.pre) {
+      return A.pre < B.pre ? -1 : 1;
     }
   }
   return 0;
@@ -125,8 +145,11 @@ async function tryAutoUpdate(options) {
   const cwd = opts.cwd || process.cwd();
   const timeout = typeof opts.updateInstallTimeoutMs === 'number' ? opts.updateInstallTimeoutMs : DEFAULT_INSTALL_TIMEOUT_MS;
   const target = PACKAGE_NAME + '@latest';
+  // Windows has no bare `npm` executable — execFile must target npm.cmd,
+  // otherwise every auto-update silently fails on Windows bots.
+  const npmBin = opts.npmBin || (process.platform === 'win32' ? 'npm.cmd' : 'npm');
   try {
-    const res = await runExecFile(execFn, 'npm', ['install', target, '--no-audit', '--no-fund'], { cwd, timeout });
+    const res = await runExecFile(execFn, npmBin, ['install', target, '--no-audit', '--no-fund'], { cwd, timeout, windowsHide: true });
     if (res.err) {
       const msg = String((res.err && res.err.message) || res.err);
       const tail = (res.stderr || '').split('\n').filter(Boolean).slice(-3).join(' | ');
@@ -152,7 +175,13 @@ async function maybeAutoUpdate(options) {
     lastCheckAt = Date.now();
     const info = await checkForUpdate(opts);
     if (!info.updateAvailable) {
-      return { checked: true, current: info.current, latest: info.latest, updateAvailable: false };
+      return {
+        checked: true,
+        current: info.current,
+        latest: info.latest,
+        updateAvailable: false,
+        ...(info.error ? { error: info.error } : {}),
+      };
     }
     log.info('update available: ' + info.current + ' -> ' + info.latest + ' — installing before login');
     if (!autoInstallEnabled(opts)) {

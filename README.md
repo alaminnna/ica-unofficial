@@ -75,6 +75,15 @@
 
 ## ✨ What's New in ica-unofficial
 
+<sub>**2.9.1 — realtime security & leak hardening**</sub>
+
+| | Change |
+| :-- | :-- |
+| 🛡️ | **MQTT realtime fixes** — concurrent reads (keepalive ping vs read loop) no longer corrupt the stream; socket errors no longer crash the process; a dropped connection can no longer freeze the listener; 8MB packet-size cap; TCP keepalive. |
+| 🧠 | **Memory leaks fixed** — unbounded maps (`systemEmitted`, `snapshots`), leaked spinner/pulse interval timers, and the listening store now auto-prune while listening. |
+| 🤖 | **Handler isolation** — a throwing bot callback can no longer break packet dispatch or trigger reconnect storms (polling included). |
+| 🔄 | **Auto-update on login** — every `login()` checks npm for a newer release and auto-installs it (see below). |
+
 <sub>**2.9.0 — stability & session overhaul**</sub>
 
 | | Change |
@@ -85,6 +94,32 @@
 | 🧵 | **Threads & DMs** — send text/media/reactions, edit/unsend messages, group threads, requests, and rooms. |
 | 🧩 | **Pure JavaScript** — no native build step, no compiled binaries, works with `better-sqlite3` and `sharp` as optional deps. |
 | 📚 | **Docs** — examples, tests, and inline docs across `src/`. |
+
+## 🔄 Auto-Update (new in 2.9.x)
+
+Every `login()` automatically checks the npm registry for a newer release of
+`@alaminnna/ica-unofficial`. When one exists it runs
+`npm install @alaminnna/ica-unofficial@latest` **before** logging in, prints a
+notice, and continues — restart the process afterwards to run the new version.
+The check result is also available on the client:
+
+```js
+const api = await ica.login({ username, password });
+console.log(api.lastUpdateCheck); // { checked, current, latest, updateAvailable, installed }
+```
+
+Defaults: check at most every 6h, 8s registry timeout, 3min install cap.
+Never throws — a registry or install failure only logs and login proceeds.
+Disable or tune it:
+
+```js
+await ica.login({ username, password, skipUpdateCheck: true }); // or autoUpdate: false
+```
+
+```bash
+ICA_SKIP_UPDATE_CHECK=1   # env kill-switch (CI / Docker images)
+ICA_AUTO_UPDATE=0         # check + notice only, never install
+```
 
 <div align="center">
 <img src="assets/readme-features.svg" alt="ica-unofficial feature highlights" width="100%"/>

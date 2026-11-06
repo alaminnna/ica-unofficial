@@ -5,8 +5,12 @@ const exceptions = require('./src/exceptions');
 const { maybeAutoUpdate, checkForUpdate } = require('./src/core/update');
 
 async function runLogin(options) {
-  await maybeAutoUpdate(options);
+  // Auto-update check: compares the running version against the npm registry
+  // and installs the latest release before login when one exists (config/env
+  // kill-switches below). Never affects the login outcome.
+  const updateInfo = await maybeAutoUpdate(options);
   const client = new Client(options);
+  client.lastUpdateCheck = updateInfo;
   if (options && (options.session || options.cookies)) {
     await client.loginWithSession(options);
   } else {

@@ -6,11 +6,10 @@ cookies.json
 bot.config.json
 device.json
 test/device/
-downloads/
-
-test/
+test/out/
 examples/
 docs/
+downloads/
 *.log
 node_modules/
 html/

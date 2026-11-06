@@ -1,13 +1,15 @@
 {
   "name": "@alaminnna/ica-unofficial",
-  "version": "2.9.0",
+  "version": "2.9.1",
   "description": "Unofficial Instagram Chat API for Node.js ? fca-style. Login, send messages, listen to events.",
   "main": "index.js",
   "files": [
     "index.js",
     "src/",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md",
+    "BUGFIXES.md"
   ],
   "scripts": {
     "test": "node test/run.js",

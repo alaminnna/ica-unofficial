@@ -1,5 +1,55 @@
 # Changelog
 
+## v2.9.1 (2026-11-05)
+
+Security/robustness hardening round (MQTT realtime, leaks, error isolation) —
+21-test regression suite (`test/run.js`) covers every fix:
+
+- **MQTT: concurrent reads no longer corrupt the stream.** The keepalive
+  watchdog (`ping()`) and the main read loop (`readOnce()`) both called
+  `transport.recvPacket()` at the same time; both attached `data` listeners to
+  the same socket, so *both* received every TCP chunk — duplicated bytes,
+  garbled packets, phantom reconnects. Reads are now serialized through an
+  in-transport queue.
+- **MQTT: a socket error can no longer crash the whole bot.** After connect the
+  transport kept no `error` listener, so an ECONNRESET/TLS alert between
+  packets raised `unhandled 'error' event` and killed the process. The
+  transport now keeps persistent `error` + `close` handlers and surfaces the
+  stored error to the next read.
+- **MQTT: a dropped connection can no longer freeze the bot.** After a socket
+  close the transport kept its dead socket reference; the next `recvPacket()`
+  attached listeners to a closed socket and hung forever. Post-close state now
+  rejects cleanly (`transport is closed (last error: …)`), so the reconnect
+  backoff runs instead.
+- **MQTT: oversized packets are refused, not buffered.** A forged
+  `remaining length` (MQTT allows up to 256MB) was buffered blindly — OOM risk.
+  Packets are capped at 8MB (`mqttot.MAX_PACKET_BYTES`).
+- **MQTT: TCP keepalive + connect-timeout fix.** Sockets now enable
+  `setKeepAlive(15s)`; the connect-phase idle timeout is disabled after
+  handshake so quiet-but-alive connections are not killed by stray `timeout`
+  events.
+- **Realtime/FBNS/polling: handler isolation.** A throwing `on()`/`onEvent()`
+  callback (bot bug) used to break packet dispatch and trigger reconnect
+  storms; all listeners and the listen-loop user callback are now isolated
+  (log + continue, `ICA_DEBUG=1` prints handler errors). Polling consumers got
+  the same isolation (`onHandlerError` hook) so one bad callback cannot stop
+  the polling loop.
+- **Memory leaks fixed:** `v3.systemEmitted` map never pruned (10s TTL prune
+  now); `v3.snapshots` capped at 500 threads (LRU-style); logger spinner/pulse
+  overwrites leaked the previous interval timer forever (previous instance is
+  now stopped, timers `unref()`ed); listening store now prunes messages/outbox
+  every 6h while listening (14-day retention).
+- **Reconnect hygiene:** `RealtimeClient`/`FbnsClient` reset `connected` before
+  connecting and tear the transport down on failed handshakes, so the watchdog
+  never pings a dead socket.
+- **Auto-update hardening:** `compareVersions` treats missing segments as zero
+  (`2.9` == `2.9.0`) and ranks pre-releases below releases (`2.9.1-beta.1` <
+  `2.9.1`); auto-install uses `npm.cmd` on Windows (`execFile('npm')` failed
+  there); registry errors are surfaced in the `maybeAutoUpdate` result;
+  `login()` attaches the result to `client.lastUpdateCheck`.
+- Tests: new hermetic `test/run.js` (21 tests, local TCP server + mocks, zero
+  Instagram traffic).
+
 ## v2.9.0 (2026-10-03)
 
 Auto-update check (new `src/core/update.js`, wired into `login()`):

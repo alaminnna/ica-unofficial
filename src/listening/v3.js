@@ -47,6 +47,19 @@ function createV3Tracker(options) {
   const ring = createAttributionRing({ windowMs });
   const snapshots = new Map();
   const systemEmitted = new Map();
+  // Long-running bots see unbounded thread ids: without caps both maps grow
+  // forever (real leak — entries are never explicitly removed).
+  const SNAPSHOT_CAP = 500;
+  const SYSTEM_EMIT_TTL_MS = 10000;
+
+  function pruneSystemEmitted(nowMs) {
+    const now = nowMs === undefined ? Date.now() : nowMs;
+    systemEmitted.forEach((entry, key) => {
+      if (now - entry.ts > SYSTEM_EMIT_TTL_MS) {
+        systemEmitted.delete(key);
+      }
+    });
+  }
 
   function selfId() {
     return (client.userId !== undefined && client.userId !== null) ? String(client.userId) : null;
@@ -164,6 +177,10 @@ function createV3Tracker(options) {
       }
     });
     if (!prev) {
+      if (snapshots.size >= SNAPSHOT_CAP) {
+        const oldest = snapshots.keys().next().value;
+        snapshots.delete(oldest);
+      }
       snapshots.set(meta.threadId, merged);
       return;
     }
@@ -281,6 +298,7 @@ function createV3Tracker(options) {
     if (!threadId) {
       return;
     }
+    pruneSystemEmitted();
     systemEmitted.set(String(threadId), { summary: summary || null, ts: Date.now() });
   }
 
@@ -302,7 +320,7 @@ function createV3Tracker(options) {
     return Boolean(marked && Date.now() - marked.ts < 5000);
   }
 
-  return { trackThread, noteActionLog, emitMappedActionLog, afterMessage, afterReaction, ring, snapshots, markSystemEmitted, isCoveredThreadUpdate };
+  return { trackThread, noteActionLog, emitMappedActionLog, afterMessage, afterReaction, ring, snapshots, systemEmitted, markSystemEmitted, isCoveredThreadUpdate };
 }
 
 module.exports = {

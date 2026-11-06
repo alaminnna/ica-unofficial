@@ -63,19 +63,31 @@ function startPolling(client, onEvent, options) {
       }
       newestByThread[threadId] = id;
       const normalized = normalizeMessage({ ...newest, thread_id: threadId }, threadId);
-      onEvent({
-        type: 'message',
-        threadID: threadId,
-        messageID: normalized.id,
-        senderID: normalized.user_id,
-        body: normalized.text || '',
-        timestamp: normalized.timestamp,
-        isGroup: Boolean(thread.is_group),
-        isPendingRequest: Boolean(thread.pending),
-        attachments: [],
-        mentions: {},
-        raw: newest,
-      });
+      // A throwing consumer callback must not kill the polling loop —
+      // pollOnce's try/catch would otherwise stop listening entirely.
+      try {
+        onEvent({
+          type: 'message',
+          threadID: threadId,
+          messageID: normalized.id,
+          senderID: normalized.user_id,
+          body: normalized.text || '',
+          timestamp: normalized.timestamp,
+          isGroup: Boolean(thread.is_group),
+          isPendingRequest: Boolean(thread.pending),
+          attachments: [],
+          mentions: {},
+          raw: newest,
+        });
+      } catch (err) {
+        if (opts.onHandlerError) {
+          try {
+            opts.onHandlerError(err);
+          } catch (ignored) {
+            // best-effort reporting only
+          }
+        }
+      }
     });
     firstPoll = false;
   }
